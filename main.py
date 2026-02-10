@@ -1,12 +1,17 @@
-from flask import Flask, request, Response
+from flask import Flask, render_template, request, Response
 import RPi.GPIO as GPIO
 import time
 import io
-from threading import Condition
+import threading
+import math
+import evdev
+from evdev import InputDevice, ecodes
 from picamera2 import Picamera2
 from picamera2.encoders import JpegEncoder
 from picamera2.outputs import FileOutput
+from threading import Condition
 
+# --- KONFIGURACJA GPIO ---
 GPIO.setmode(GPIO.BOARD)
 GPIO.setwarnings(False)
 
@@ -26,6 +31,7 @@ GPIO.setup(IN4, GPIO.OUT)
 GPIO.setup(GPIO_TRIGGER, GPIO.OUT)
 GPIO.setup(GPIO_ECHO, GPIO.IN)
 
+# --- USTAWIENIA FLASK I KAMERY ---
 app = Flask(__name__)
 camera = None
 streaming_output = None
@@ -52,7 +58,6 @@ def initialize_camera():
         print(f"Dostępne kamery: {available_cameras}")
         camera = Picamera2()
 
-        # Konfiguracja wideo (320x240, 15 fps)
         video_config = camera.create_video_configuration(
             main={"size": (320, 240), "format": "RGB888"}, 
             controls={"FrameRate": 15}
@@ -122,7 +127,110 @@ def right():
     GPIO.output(IN3, False)
     GPIO.output(IN4, True)
 
+# --- WĄTEK STEROWANIA PADEM ---
+def gamepad_loop():
+    print("START WĄTKU PADA: Szukam urządzenia...")
+    gamepad = None
+    
+    CENTER = 128
+    DEADZONE = 60
+    SAFE_DISTANCE = 30
+    
+    y_raw = 128
+    x_raw = 128
+    last_action = "stop"
+    
+    while True:
+        if gamepad is None:
+            try:
+                devices = [evdev.InputDevice(path) for path in evdev.list_devices()]
+                for device in devices:
+                    if "Wireless Controller" in device.name and "Motion" not in device.name and "Touchpad" not in device.name:
+                        gamepad = device
+                        print(f"PAD PODŁĄCZONY: {device.name}")
+                        break
+                if gamepad is None:
+                    time.sleep(2)
+                    continue
+            except Exception:
+                time.sleep(2)
+                continue
+
+        try:
+            while True:
+                event = gamepad.read_one()
+                if event is None:
+                    break
+                
+                if event.type == ecodes.EV_ABS:
+                    if event.code == 1:   
+                        y_raw = event.value
+                    elif event.code == 0: 
+                        x_raw = event.value
+
+            dx = x_raw - CENTER
+            dy = y_raw - CENTER
+            distance_val = math.sqrt(dx*dx + dy*dy)
+            
+            intended_action = "stop"
+
+            if distance_val > DEADZONE:
+                if abs(dy) > abs(dx):
+                    if dy < 0: intended_action = "forward"
+                    else:      intended_action = "backward"
+                else:
+                    if dx < 0: intended_action = "left"
+                    else:      intended_action = "right"
+            
+            final_action = intended_action
+
+            if intended_action == "forward":
+                dist_check = distance()
+                if dist_check < SAFE_DISTANCE:
+                    final_action = "blocked" 
+            
+            if final_action != last_action:
+                if final_action == "forward":
+                    forward()
+                    print(f"PAD: Jazda (Y={y_raw})")
+                elif final_action == "backward":
+                    backward()
+                    print(f"PAD: Tył")
+                elif final_action == "left":
+                    right()
+                    print(f"PAD: Lewo")
+                elif final_action == "right":
+                    left()
+                    print(f"PAD: Prawo")
+                elif final_action == "blocked":
+                    stop()
+                    print(f"⚠️ BLOKADA: Przeszkoda {dist_check:.1f}cm!")
+                else:
+                    stop()
+
+                last_action = final_action
+            
+            time.sleep(0.05) 
+
+        except OSError:
+            print("Pad rozłączony.")
+            gamepad = None
+            stop()
+        except Exception as e:
+            print(f"Błąd pętli pada: {e}")
+            stop()
+            time.sleep(1)
+
+def start_gamepad_thread():
+    gamepad_thread = threading.Thread(target=gamepad_loop)
+    gamepad_thread.daemon = True
+    gamepad_thread.start()
+
 # --- ROUTING FLASK ---
+@app.route("/")
+def index():
+    return render_template("index.html")
+
 @app.route("/move", methods=["POST"])
 def move():
     action = request.form.get("action")
@@ -169,6 +277,7 @@ def video_feed():
 
 if __name__ == "__main__":
     initialize_camera()
+    start_gamepad_thread()
     
     try:
         app.run(host="0.0.0.0", port=8080, debug=False, threaded=True) 
